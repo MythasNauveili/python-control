@@ -1101,13 +1101,14 @@ def bode_plot(
 _nyquist_defaults = {
     'nyquist.primary_style': ['-', '-.'],       # style for primary curve
     'nyquist.mirror_style': ['--', ':'],        # style for mirror curve
-    'nyquist.arrows': 2,                        # number of arrows around curve
+    'nyquist.arrows': 3,                        # number of arrows around curve
     'nyquist.arrow_size': 8,                    # pixel size for arrows
     'nyquist.encirclement_threshold': 0.05,     # warning threshold
     'nyquist.indent_radius': 1e-4,              # indentation radius
     'nyquist.indent_direction': 'right',        # indentation direction
-    'nyquist.indent_points': 50,                # number of points to insert
-    'nyquist.max_curve_magnitude': 20,          # clip large values
+    'nyquist.indent_points': 200,               # number of points to insert
+    'nyquist.max_curve_magnitude': 15,          # rescale large values
+    'nyquist.blend_fraction': 0.15,             # when to start scaling
     'nyquist.max_curve_offset': 0.02,           # offset of primary/mirror
     'nyquist.start_marker': 'o',                # marker at start of curve
     'nyquist.start_marker_size': 4,             # size of the marker
@@ -1639,6 +1640,10 @@ def nyquist_plot(
         The matplotlib axes to draw the figure on.  If not specified and
         the current figure has a single axes, that axes is used.
         Otherwise, a new figure is created.
+    blend_fraction : float, optional
+        For portions of the Nyquist curve that are scaled to have a maximum
+        magnitude of `max_curve_magnitude`, begin a smooth rescaling at
+        this fraction of `max_curve_magnitude`. Default value is 0.15.
     encirclement_threshold : float, optional
         Define the threshold for generating a warning if the number of net
         encirclements is a non-integer value.  Default value is 0.05 and can
@@ -1655,7 +1660,7 @@ def nyquist_plot(
         portions of the contour are plotted using a different line style.
     label : str or array_like of str, optional
         If present, replace automatically generated label(s) with the given
-        label(s).  If sysdata is a list, strings should be specified for each
+        label(s).  If `data` is a list, strings should be specified for each
         system.
     label_freq : int, optional
         Label every nth frequency on the plot.  If not specified, no labels
@@ -1686,8 +1691,8 @@ def nyquist_plot(
         elements is equivalent to providing `omega_limits`.
     omega_num : int, optional
         Number of samples to use for the frequency range.  Defaults to
-        `config.defaults['freqplot.number_of_samples']`.  Ignored if data is
-        not a list of systems.
+        `config.defaults['freqplot.number_of_samples']`.  Ignored if `data`
+        is not a system or list of systems.
     plot : bool, optional
         (legacy) If given, `nyquist_plot` returns the legacy return values
         of (counts, contours).  If False, return the values with no plot.
@@ -1752,8 +1757,8 @@ def nyquist_plot(
     to avoid poles, resulting in a scaling of the Nyquist plot, the line
     styles are according to the settings of the `primary_style` and
     `mirror_style` keywords.  By default the scaled portions of the primary
-    curve use a dotted line style and the scaled portion of the mirror
-    image use a dashdot line style.
+    curve use a dashdot line style and the scaled portions of the mirror
+    image use a dotted line style.
 
     Examples
     --------
@@ -1785,6 +1790,8 @@ def nyquist_plot(
     ax_user = ax
     max_curve_magnitude = config._get_param(
         'nyquist', 'max_curve_magnitude', kwargs, _nyquist_defaults, pop=True)
+    blend_fraction = config._get_param(
+        'nyquist', 'blend_fraction', kwargs, _nyquist_defaults, pop=True)
     max_curve_offset = config._get_param(
         'nyquist', 'max_curve_offset', kwargs, _nyquist_defaults, pop=True)
     rcParams = config._get_param('ctrlplot', 'rcParams', kwargs, pop=True)
@@ -1879,10 +1886,16 @@ def nyquist_plot(
     legend_loc, _, show_legend = _process_legend_keywords(
         kwargs, None, 'upper right')
 
+    # Figure out where the blended curve should start
+    if blend_fraction < 0 or blend_fraction > 1:
+        raise ValueError("blend_fraction must be between 0 and 1")
+    blend_curve_start = (1 - blend_fraction) * max_curve_magnitude
+
     # Create a list of lines for the output
-    out = np.empty(len(nyquist_responses), dtype=object)
-    for i in range(out.shape[0]):
-        out[i] = []             # unique list in each element
+    out = np.empty((len(nyquist_responses), 4), dtype=object)
+    for i in range(len(nyquist_responses)):
+        for j in range(4):
+            out[i, j] = []      # unique list in each element
 
     for idx, response in enumerate(nyquist_responses):
         resp = response.response
@@ -1893,20 +1906,31 @@ def nyquist_plot(
 
         # Find the different portions of the curve (with scaled pts marked)
         reg_mask = np.logical_or(
-            np.abs(resp) > max_curve_magnitude,
-            splane_contour.real != 0)
-        # reg_mask = np.logical_or(
-        #     np.abs(resp.real) > max_curve_magnitude,
-        #     np.abs(resp.imag) > max_curve_magnitude)
+            np.abs(resp) > blend_curve_start,
+            np.logical_not(np.isclose(splane_contour.real, 0)))
 
         scale_mask = ~reg_mask \
             & np.concatenate((~reg_mask[1:], ~reg_mask[-1:])) \
             & np.concatenate((~reg_mask[0:1], ~reg_mask[:-1]))
 
         # Rescale the points with large magnitude
-        rescale = np.logical_and(
-            reg_mask, abs(resp) > max_curve_magnitude)
-        resp[rescale] *= max_curve_magnitude / abs(resp[rescale])
+        rescale_idx = (np.abs(resp) > blend_curve_start)
+
+        if np.any(rescale_idx):  # Only process if rescaling is needed
+            subset = resp[rescale_idx]
+            abs_subset = np.abs(subset)
+            unit_vectors = subset / abs_subset  # Preserve phase/direction
+
+            if blend_curve_start == max_curve_magnitude:
+                # Clip at max_curve_magnitude
+                resp[rescale_idx] = max_curve_magnitude * unit_vectors
+            else:
+                # Logistic scaling
+                newmag = blend_curve_start + \
+                    (max_curve_magnitude - blend_curve_start) * \
+                    (abs_subset - blend_curve_start) / \
+                    (abs_subset + max_curve_magnitude - 2 * blend_curve_start)
+                resp[rescale_idx] = newmag * unit_vectors
 
         # Get the label to use for the line
         label = response.sysname if line_labels is None else line_labels[idx]
@@ -1917,7 +1941,7 @@ def nyquist_plot(
         p = ax.plot(
             x_reg, y_reg, primary_style[0], color=color, label=label, **kwargs)
         c = p[0].get_color()
-        out[idx] += p
+        out[idx, 0] += p
 
         # Figure out how much to offset the curve: the offset goes from
         # zero at the start of the scaled section to max_curve_offset as
@@ -1929,12 +1953,12 @@ def nyquist_plot(
         x_scl = np.ma.masked_where(scale_mask, resp.real)
         y_scl = np.ma.masked_where(scale_mask, resp.imag)
         if x_scl.count() >= 1 and y_scl.count() >= 1:
-            out[idx] += ax.plot(
+            out[idx, 1] += ax.plot(
                 x_scl * (1 + curve_offset),
                 y_scl * (1 + curve_offset),
                 primary_style[1], color=c, **kwargs)
         else:
-            out[idx] += [None]
+            out[idx, 1] += [None]
 
         # Plot the primary curve (invisible) for setting arrows
         x, y = resp.real.copy(), resp.imag.copy()
@@ -1949,15 +1973,15 @@ def nyquist_plot(
         # Plot the mirror image
         if mirror_style is not False:
             # Plot the regular and scaled segments
-            out[idx] += ax.plot(
+            out[idx, 2] += ax.plot(
                 x_reg, -y_reg, mirror_style[0], color=c, **kwargs)
             if x_scl.count() >= 1 and y_scl.count() >= 1:
-                out[idx] += ax.plot(
+                out[idx, 3] += ax.plot(
                     x_scl * (1 - curve_offset),
                     -y_scl * (1 - curve_offset),
                     mirror_style[1], color=c, **kwargs)
             else:
-                out[idx] += [None]
+                out[idx, 3] += [None]
 
             # Add the arrows (on top of an invisible contour)
             x, y = resp.real.copy(), resp.imag.copy()
@@ -1967,12 +1991,15 @@ def nyquist_plot(
             _add_arrows_to_line2D(
                 ax, p[0], arrow_pos, arrowstyle=arrow_style, dir=-1)
         else:
-            out[idx] += [None, None]
+            out[idx, 2] += [None]
+            out[idx, 3] += [None]
 
         # Mark the start of the curve
         if start_marker:
-            ax.plot(resp[0].real, resp[0].imag, start_marker,
-                     color=c, markersize=start_marker_size)
+            segment = 0 if 0 in rescale_idx else 1      # regular vs scaled
+            out[idx, segment] += ax.plot(
+                resp[0].real, resp[0].imag, start_marker,
+                color=c, markersize=start_marker_size)
 
         # Mark the -1 point
         ax.plot([-1], [0], 'r+')
